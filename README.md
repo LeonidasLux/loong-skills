@@ -9,5 +9,6 @@
 ```
 
 - 技能判定：根目录下的一级子目录内包含 `SKILL.md` 即视为一个技能。
+- 技能列表会显示 `SKILL.md` 元数据里的 `description`（超长时按终端宽度截断）。
 - 目标 agent 与其 skills 目录在 `link-skills.sh` 顶部的 `AGENT_PATHS` 中维护，一个 agent 可配置多个目录。
 - 不加 `--force` 时，同名实体目录/文件只会提示跳过；加上后原内容会被移动到 `~/.link-skills-backup/<时间戳>/<agent>/`，确认无误后可自行删除（备份位置可用环境变量 `LINK_SKILLS_BACKUP_DIR` 修改）。

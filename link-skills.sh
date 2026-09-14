@@ -42,6 +42,9 @@ BACKUP_ROOT="${LINK_SKILLS_BACKUP_DIR:-$HOME/.link-skills-backup}"
 RUN_BACKUP_DIR=""
 BACKUP_LAST=""
 
+# 纯文本模式下状态行使用的短标签（长度与选项数一致时生效）
+UI_SHORT_LABELS=()
+
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
   C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
@@ -133,8 +136,10 @@ ui_multiselect() {
       done
     else
       flag="未选中"; (( sel[cur] )) && flag="已选中"
+      local shown="${items[cur]}"
+      (( ${#UI_SHORT_LABELS[@]} == n )) && shown="${UI_SHORT_LABELS[cur]}"
       printf '\r\033[K  → 第 %d/%d 项 %s（%s）  已选 %d/%d ' \
-        "$(( cur + 1 ))" "$n" "${items[cur]}" "$flag" "$cnt" "$n"
+        "$(( cur + 1 ))" "$n" "$shown" "$flag" "$cnt" "$n"
     fi
 
     key=""
@@ -173,23 +178,93 @@ ui_multiselect() {
 }
 
 # ---------------------------------------------------------------------------
-# 收集本仓库中的技能目录
+# 收集本仓库中的技能目录及其描述
 # ---------------------------------------------------------------------------
-is_skill_dir() {
-  local dir="$1"
-  [[ -f "$dir/SKILL.md" ]] && return 0
-  [[ -n "$(find "$dir" -mindepth 2 -name SKILL.md -not -path '*/.git/*' -print -quit 2>/dev/null)" ]]
+
+# 技能目录里的 SKILL.md（优先一级目录下的），没有则无输出
+skill_md_path() {
+  local dir="$1" found
+  if [[ -f "$dir/SKILL.md" ]]; then
+    printf '%s\n' "$dir/SKILL.md"
+    return 0
+  fi
+  found="$(find "$dir" -mindepth 2 -name SKILL.md -not -path '*/.git/*' -print -quit 2>/dev/null)"
+  [[ -n $found ]] && printf '%s\n' "$found"
+  return 0
+}
+
+# 读取 SKILL.md 元数据里的 description，输出单行文本（支持多行、引号写法）
+skill_description() {
+  local file="$1"
+  [[ -f $file ]] || return 0
+  awk '
+    NR == 1 {
+      if ($0 !~ /^---[ \t]*$/) exit
+      in_fm = 1
+      next
+    }
+    in_fm {
+      if ($0 ~ /^---[ \t]*$/) exit
+      if (!found) {
+        if ($0 ~ /^description:[ \t]*/) {
+          line = $0
+          sub(/^description:[ \t]*/, "", line)
+          desc = line
+          found = 1
+        }
+        next
+      }
+      # 续行：缩进行或不像 "key:" 的行
+      if ($0 ~ /^[ \t]/ || $0 !~ /^[A-Za-z_][A-Za-z0-9_-]*:/) {
+        desc = desc " " $0
+        next
+      }
+      exit
+    }
+    END {
+      if (!found) exit
+      sub(/^[|>][-+0-9]*[ \t]*/, "", desc)
+      gsub(/[ \t]+/, " ", desc)
+      sub(/^[ \t]+/, "", desc)
+      sub(/[ \t]+$/, "", desc)
+      if (desc ~ /^["\047].*["\047]$/) desc = substr(desc, 2, length(desc) - 2)
+      print desc
+    }
+  ' "$file"
+}
+
+# 按终端显示宽度截断文本（中文等全角字符按 2 列计）
+clip_text() {
+  local text="$1" max="$2" out="" i=0 n ch w width=0
+  text="${text//$'\n'/ }"
+  n=${#text}
+  while (( i < n )); do
+    ch="${text:i:1}"
+    if [[ $ch == [$'\x20'-$'\x7e'] ]]; then w=1; else w=2; fi
+    if (( width + w > max )); then
+      printf '%s…' "$out"
+      return 0
+    fi
+    out+="$ch"
+    width=$(( width + w ))
+    i=$(( i + 1 ))
+  done
+  printf '%s' "$out"
 }
 
 collect_skills() {
-  local d name
+  local d name md
   SKILLS=()
+  SKILL_DESCS=()
   for d in "$ROOT_DIR"/*/; do
     [[ -d $d ]] || continue
     d="${d%/}"
     name="${d##*/}"
     [[ $name == .* ]] && continue
-    is_skill_dir "$d" && SKILLS+=("$name")
+    md="$(skill_md_path "$d")"
+    [[ -n $md ]] || continue
+    SKILLS+=("$name")
+    SKILL_DESCS+=("$(skill_description "$md")")
   done
 }
 
@@ -211,10 +286,31 @@ main() {
   collect_skills
   (( ${#SKILLS[@]} > 0 )) || die "在 $ROOT_DIR 下没有找到包含 SKILL.md 的技能目录。"
 
+  # 技能列表：名称 + SKILL.md 里的 description
+  local i name_w=0 cols desc_max
+  local name desc
+  for name in "${SKILLS[@]}"; do (( ${#name} > name_w )) && name_w=${#name}; done
+  cols="$(tput cols 2>/dev/null || true)"
+  [[ $cols =~ ^[0-9]+$ ]] || cols="${COLUMNS:-110}"
+  (( cols > 20 )) || cols=110
+  desc_max=$(( cols - name_w - 8 ))
+  (( desc_max < 12 )) && desc_max=12
+  local -a skill_labels=()
+  for (( i = 0; i < ${#SKILLS[@]}; i++ )); do
+    name="${SKILLS[i]}"; desc="${SKILL_DESCS[i]}"
+    if [[ -n $desc ]]; then
+      skill_labels+=("$(printf '%s%*s  %s%s%s' "$name" "$(( name_w - ${#name} ))" '' \
+        "$C_DIM" "$(clip_text "$desc" "$desc_max")" "$C_RESET")")
+    else
+      skill_labels+=("$name")
+    fi
+  done
+
   local -a chosen_skills=()
-  ui_multiselect "请选择要创建软链接的技能" "$ROOT_DIR" "${SKILLS[@]}" \
+  UI_SHORT_LABELS=("${SKILLS[@]}")
+  ui_multiselect "请选择要创建软链接的技能" "$ROOT_DIR" "${skill_labels[@]}" \
     || die "已取消。"
-  local i
+  UI_SHORT_LABELS=()
   for i in ${UI_SELECTED[@]+"${UI_SELECTED[@]}"}; do chosen_skills+=("${SKILLS[i]}"); done
   (( ${#chosen_skills[@]} > 0 )) || { printf '%s未选择任何技能，退出。%s\n' "$C_YELLOW" "$C_RESET"; exit 0; }
 
