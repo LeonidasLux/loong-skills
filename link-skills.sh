@@ -6,7 +6,7 @@
 #
 # 用法：
 #   ./link-skills.sh            交互式选择技能与目标 agent
-#   ./link-skills.sh --force    同名软链接已指向别处时，重新指向本仓库
+#   ./link-skills.sh --force    替换同名项：软链接重新指向；实体目录/文件先备份再链接
 #   ./link-skills.sh --plain    纯文本模式（终端不支持光标控制时用这个）
 #   ./link-skills.sh -h         查看帮助
 #
@@ -37,6 +37,11 @@ UI_TUI=1
 [[ -n ${TERM:-} && ${TERM:-} != dumb ]] || UI_TUI=0
 UI_ACTIVE=0
 
+# --force 替换同名实体目录/文件时，原内容会移动到 <备份目录>/<时间戳>/<agent>/ 下
+BACKUP_ROOT="${LINK_SKILLS_BACKUP_DIR:-$HOME/.link-skills-backup}"
+RUN_BACKUP_DIR=""
+BACKUP_LAST=""
+
 if [[ -t 1 ]]; then
   C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
   C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_CYAN=$'\033[36m'
@@ -55,6 +60,24 @@ ui_restore() {
   UI_ACTIVE=0
   printf '\033[?25h' 2>/dev/null || true
   (( UI_TUI )) && { printf '\033[?1049l' 2>/dev/null || true; }
+  return 0
+}
+
+# 把已存在的 dst 移动到备份目录，备份路径写入 BACKUP_LAST
+backup_existing() {
+  local agent="$1" dst="$2" target base suffix=0
+  if [[ -z $RUN_BACKUP_DIR ]]; then
+    RUN_BACKUP_DIR="$BACKUP_ROOT/$(date +%Y%m%d-%H%M%S)"
+  fi
+  target="$RUN_BACKUP_DIR/$agent"
+  mkdir -p "$target" 2>/dev/null || return 1
+  base="$(basename "$dst")"
+  while [[ -e "$target/$base" || -L "$target/$base" ]]; do
+    suffix=$(( suffix + 1 ))
+    base="$(basename "$dst").$suffix"
+  done
+  mv -- "$dst" "$target/$base" || return 1
+  BACKUP_LAST="$target/$base"
   return 0
 }
 
@@ -226,6 +249,7 @@ main() {
   local -a results=()
   local created=0 exists=0 skipped=0 failed=0 target_dirs=0
   local skill src dst cur_target
+  RUN_BACKUP_DIR=""
   for name in "${chosen_agents[@]}"; do
     for path in ${AGENT_PATHS[$name]}; do
       target_dirs=$(( target_dirs + 1 ))
@@ -257,8 +281,21 @@ main() {
             skipped=$(( skipped + 1 ))
           fi
         elif [[ -e $dst ]]; then
-          results+=("$name|$path|$skill|skip|同名文件/目录已存在")
-          skipped=$(( skipped + 1 ))
+          if (( FORCE )); then
+            if ! backup_existing "$name" "$dst"; then
+              results+=("$name|$path|$skill|failed|备份失败，原内容未改动")
+              failed=$(( failed + 1 ))
+            elif ln -s "$src" "$dst" 2>/dev/null; then
+              results+=("$name|$path|$skill|created|原内容备份到 ${BACKUP_LAST/#$HOME/\~}")
+              created=$(( created + 1 ))
+            else
+              results+=("$name|$path|$skill|failed|已备份到 ${BACKUP_LAST/#$HOME/\~}，但创建链接失败")
+              failed=$(( failed + 1 ))
+            fi
+          else
+            results+=("$name|$path|$skill|skip|同名文件/目录已存在（加 --force 可备份后替换）")
+            skipped=$(( skipped + 1 ))
+          fi
         elif ln -s "$src" "$dst" 2>/dev/null; then
           results+=("$name|$path|$skill|created|")
           created=$(( created + 1 ))
@@ -290,6 +327,9 @@ main() {
   done
   printf '\n技能 %d 个 × 目标目录 %d 个：%s新增 %d%s，已存在 %d，跳过 %d，失败 %d\n' \
     "${#chosen_skills[@]}" "$target_dirs" "$C_GREEN" "$created" "$C_RESET" "$exists" "$skipped" "$failed"
+  if [[ -n $RUN_BACKUP_DIR && -d $RUN_BACKUP_DIR ]]; then
+    printf '被替换的原内容已备份到 %s（确认无误后可自行删除）\n' "${RUN_BACKUP_DIR/#$HOME/\~}"
+  fi
 }
 
 main "$@"
