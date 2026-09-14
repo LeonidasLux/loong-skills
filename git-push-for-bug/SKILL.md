@@ -29,11 +29,11 @@ $ARGUMENTS
 
 根据用户输入，执行以下操作：
 
-1.  调用 `scripts/upload_image.py` 脚本获取 RDC 单据详细信息（标题、描述、故障等级等信息）
+1.  调用 `scripts/query_rdc_item.py` 脚本获取 RDC 单据详细信息（标题、描述、故障等级等信息）
     执行命令实例：
 
 ```bash
-`python3 scripts/upload_image.py DT_PP-123456`
+`python3 scripts/query_rdc_item.py DT_PP-123456`
 ```
 
 2.  生成 git message
