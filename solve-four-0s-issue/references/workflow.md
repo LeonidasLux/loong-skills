@@ -37,6 +37,8 @@
 | `sync.stash_before_pull` | 拉取前是否 `git stash` 本地改动 |
 | `sync.pull` | 是否 `pull` 远端 |
 | `sync.blame` | 是否用 `git blame` 补全提交者 |
+| `sync.timeout` | 单条 git 命令超时秒数（默认 180）。超时按进程组终止，并把该仓库降级为「按本地现有代码分析」 |
+| `sync.ssh_keepalive` | 为 ssh 追加 `ConnectTimeout`/`ServerAliveInterval`，远端静默时快速失败而不是挂死 |
 | `output.dir` | 扫描结果（JSON/CSV）输出目录，**可以不配置**；缺省时写到执行 `scan` 命令时的当前目录 |
 | `request.timeout` / `request.retries` | 单请求超时秒数与重试次数 |
 
@@ -74,6 +76,8 @@ python3 scripts/scan_leaks.py scan --out-dir /path/to/results  # 指定结果目
 退出码：`0` 成功；`1` 发现问题（仅 `--fail-on-leak`）；`2` 配置不完整；`3` cookie 无效；`4` 运行出错。
 
 `scan` 会先做配置校验和 cookie 校验，任一不通过都会直接退出，不会抓取数据。
+
+同步阶段对每个仓库执行：按需 `git stash`（仅跟踪文件）→ `git checkout <配置分支>` → `git pull --ff-only`。每条命令都有超时（`sync.timeout`，默认 180 秒）并按进程组终止，另外给 ssh 加了保活参数，所以远端 Gerrit 静默时不会无限等待：超时或拉取失败只写进 `warnings`，该仓库降级为按本地现有代码分析，其余仓库继续。注意进度日志在 `scan` 结束前就会实时输出，看到长时间不动时不要急着 kill，先看是否有 `[sync]` 日志。
 
 结果目录优先级为 `--out-dir` > `output.dir` > 当前工作目录。默认落到当前目录，所以从技能根目录直接运行时结果会出现在技能目录里；在会话中执行时建议显式指定到临时目录（例如 `--out-dir /media/vdc/0668001277/workspace/tmp/solve-four-0s-issue`），避免把扫描产物留在仓库工作区。
 
@@ -127,5 +131,7 @@ python3 scripts/scan_leaks.py scan --out-dir /path/to/results  # 指定结果目
 | 接口返回 400 Bad Request | 说明请求参数不完整；本脚本已内置 datatables 全量参数，若平台改版需同步更新 `EXECUTION_COLUMNS` / `ISSUE_COLUMNS` |
 | `local_path 不存在或不是目录` | 用提示的路径克隆仓库，或修正配置 |
 | `warnings` 里出现“仓库名与配置不一致” | 任务 ID 配错了，用扫描结果里的仓库名核对 `projects[].kw_id` / `coverity_id` |
-| `git` 同步失败（本地改动、分支不存在、无 upstream） | 把失败原因原样告知用户，请其处理后重跑；或用 `--no-sync` 先出结果 |
+| `git` 同步失败（本地改动、分支不存在、无 upstream） | 该仓库会被跳过并记入 `warnings`，其余仓库照常；把原因原样告知用户，或用 `--no-sync` 先出结果 |
+| 同步阶段长时间没有输出、像是卡住 | 现在有超时兜底，不会无限等待：等 `sync.timeout`（默认 180 秒）到点即可看到 `[sync]` 降级日志。若确实需要拉取，调大 `sync.timeout`；若不需要更新代码，用 `--no-sync` |
+| 想确认 ssh 是否真的在传输数据 | 查看连接状态 `ss -tni \| grep -A1 29418`，对比 `lastrcv`/`lastsnd`；保活参数生效后静默连接会在约 60 秒内被 ssh 自行断开 |
 | 结果为空但用户认为有问题 | 检查 `cca.kw.status_filter` / `cca.coverity.only_unclassified` 口径，以及任务最近一次执行时间 |

@@ -60,8 +60,10 @@ projects:
 sync:
   enabled: true              # false 时不 stash/pull/checkout，直接分析当前工作区
   stash_before_pull: true    # 拉取前先 git stash，避免本地改动阻塞
-  pull: true                 # 是否在检出分支前后 pull 远端
+  pull: true                 # 检出配置分支后是否 pull 远端（失败只告警，不中断）
   blame: true                # 是否用 git blame 查询缺陷提交者
+  timeout: 180               # 单条 git 命令（fetch/checkout/blame）超时秒数，超时终止并降级
+  ssh_keepalive: true        # 给 ssh 加保活参数，避免远端静默时无限等待
 
 # 扫描结果输出（本项可以不配置）
 # 留空或缺省时，结果写到执行 scan 命令时的当前目录；

@@ -29,9 +29,11 @@ FOUR0S_CONFIG 覆盖；凭据可用 FOUR0S_CCA_COOKIE / FOUR0S_CCA_CSRF 覆盖�
 
 import argparse
 import csv
+import io
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -508,65 +510,156 @@ def normalize_line_numbers(leaks):
 # --------------------------------------------------------------------------- #
 # 本地仓库同步与提交者分析
 # --------------------------------------------------------------------------- #
-def execute_command(command, work_dir):
-    result = subprocess.run(
-        command, cwd=work_dir, universal_newlines=True, stdout=subprocess.PIPE
-    )
-    if result.returncode == 0:
-        return result.stdout
-    print(result.stdout)
-    raise RuntimeError("command exec failure")
+# 单条 git 命令的默认超时（秒）。远端（如 Gerrit）静默无响应时必须能主动放弃，
+# 否则整轮扫描会无限等待——sync_repositories 逐条命令都带超时。
+DEFAULT_GIT_TIMEOUT = 180
+
+
+class GitTimeout(RuntimeError):
+    """git 命令超时，通常是远端网络卡住。"""
+
+
+def _terminate_process_group(proc):
+    """按进程组终止，避免只杀掉 git 却留下 ssh 子进程。"""
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            return
+        try:
+            proc.wait(timeout=5)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
+def _run_process(command, work_dir, timeout, env=None):
+    """执行外部命令，超时按进程组终止；返回 (returncode, stdout, stderr)。"""
+    try:
+        proc = subprocess.Popen(
+            command,
+            cwd=work_dir or None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            env=env or os.environ.copy(),
+            start_new_session=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"命令不存在：{command[0]}") from exc
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _terminate_process_group(proc)
+        raise GitTimeout(f"命令超时（>{timeout}s 已终止）：{' '.join(command)}")
+    return proc.returncode, out or "", err or ""
+
+
+def _ssh_base_command(cfg, code_path=""):
+    """ssh 命令基线：优先 GIT_SSH_COMMAND，其次 git config core.sshCommand。"""
+    if "_ssh_base" in cfg:
+        return cfg["_ssh_base"]
+    base = os.environ.get("GIT_SSH_COMMAND")
+    if not base:
+        rc, out, _ = _run_process(["git", "config", "--get", "core.sshCommand"], code_path, 10)
+        base = out.strip() if rc == 0 else ""
+    base = base or "ssh"
+    # 远端静默时让 ssh 自己发现并断开，而不是无限等待
+    if "ServerAliveInterval" not in base:
+        base = f"{base} -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=4"
+    cfg["_ssh_base"] = base
+    return base
+
+
+def _git_env(cfg, code_path=""):
+    """git 子进程环境：不弹交互提示，可选给 ssh 加保活参数。"""
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+    env["GIT_PAGER"] = "cat"
+    if not (cfg.get("sync") or {}).get("ssh_keepalive", True):
+        return env
+    env["GIT_SSH_COMMAND"] = _ssh_base_command(cfg, code_path)
+    return env
+
+
+def _git_timeout(cfg, default=DEFAULT_GIT_TIMEOUT):
+    configured = (cfg.get("sync") or {}).get("timeout", default)
+    try:
+        return max(5, int(configured))
+    except (TypeError, ValueError):
+        return default
+
+
+def run_git(cfg, code_path, args, timeout=None, check=True):
+    """在指定仓库执行 git 命令；check=True 时非 0 退出码抛 RuntimeError。"""
+    timeout = timeout or _git_timeout(cfg)
+    rc, out, err = _run_process(["git", *args], code_path, timeout, _git_env(cfg, code_path))
+    if check and rc != 0:
+        detail = (err or out or "").strip().replace("\n", " ")
+        raise RuntimeError(f"git {' '.join(args)} 失败（exit={rc}）：{detail[:300]}")
+    return rc, out, err
 
 
 def sync_repositories(cfg, projects, log=print):
-    """按项目同步本地仓库（stash -> pull -> checkout -> pull）。
+    """按项目同步本地仓库：stash（可选）-> checkout 配置分支 -> pull。
 
-    返回 (已同步的项目名集合, 同步失败信息列表)。同步失败的仓库仍会继续扫描，
-    只是不再做 commit 归属分析，避免一个仓库卡住整轮扫描。
+    返回 (可用于 blame 的项目名集合, 告警列表)。checkout 成功即视为代码可用；
+    pull 失败或超时只记告警并降级为使用本地现有代码，不会卡住或中断整轮扫描。
     """
     sync_cfg = cfg.get("sync") or {}
     if not sync_cfg.get("enabled", True):
         log("[sync] 已禁用本地仓库同步（sync.enabled=false）")
         return set(), []
-    try:
-        import git
-    except ImportError as exc:  # pragma: no cover - 环境缺依赖时给出明确提示
-        raise RuntimeError("缺少 GitPython，无法同步本地仓库：pip install gitpython") from exc
 
-    synced, failures = set(), []
+    timeout = _git_timeout(cfg)
+    synced, warnings = set(), []
     for project in projects:
         name = str(project.get("name") or "").strip()
         code_path = str(project.get("local_path") or "").strip()
         branch = str(project.get("branch") or "").strip()
         try:
-            repo = git.Repo(code_path)
-            if sync_cfg.get("stash_before_pull", True) and repo.is_dirty(untracked_files=False):
-                repo.git.stash()
-                log(f"[sync] {name}: 已 stash 本地改动")
-            if sync_cfg.get("pull", True):
-                repo.remotes.origin.pull()
-            repo.git.checkout(branch)
-            if sync_cfg.get("pull", True):
-                repo.remotes.origin.pull()
+            if not Path(code_path).is_dir():
+                raise RuntimeError(f"本地路径不存在：{code_path}")
+            rc, _, _ = run_git(cfg, code_path, ["rev-parse", "--git-dir"], timeout=30, check=False)
+            if rc != 0:
+                raise RuntimeError(f"{code_path} 不是 git 仓库")
+
+            if sync_cfg.get("stash_before_pull", True):
+                _, dirty, _ = run_git(
+                    cfg, code_path, ["status", "--porcelain", "--untracked-files=no"], check=False
+                )
+                if dirty.strip():
+                    run_git(cfg, code_path, ["stash", "push", "-q"], check=False)
+                    log(f"[sync] {name}: 已 stash 未提交改动（git stash pop 可恢复）")
+
+            run_git(cfg, code_path, ["checkout", branch], timeout=min(timeout, 120))
             synced.add(name)
-            log(f"[sync] {name}: 已切换到 {branch} 并更新代码")
-        except Exception as exc:  # git 异常类型多，统一兜底
-            message = f"{name}: 同步失败（{type(exc).__name__}: {exc}）"
-            failures.append(message)
+
+            if not sync_cfg.get("pull", True):
+                log(f"[sync] {name}: 已切换到 {branch}（未拉取）")
+                continue
+            try:
+                run_git(cfg, code_path, ["pull", "--ff-only"], timeout=timeout)
+                log(f"[sync] {name}: 已切换到 {branch} 并更新到最新代码")
+            except (GitTimeout, RuntimeError) as exc:
+                message = f"{name}: 已切到 {branch}，但拉取最新代码失败（{exc}）；本次按本地现有代码分析"
+                warnings.append(message)
+                log(f"[sync] {name}: 拉取失败，已降级为使用本地代码")
+        except GitTimeout as exc:
+            message = f"{name}: 同步超时已跳过（{exc}）"
+            warnings.append(message)
             log(f"[sync] {message}")
-    return synced, failures
+        except Exception as exc:
+            message = f"{name}: 同步失败已跳过（{type(exc).__name__}: {exc}）"
+            warnings.append(message)
+            log(f"[sync] {message}")
+    return synced, warnings
 
 
 def attach_committers(cfg, leaks, synced_projects, log=print):
     """用 git blame 补全缺陷提交者（找不到时保持为空）。"""
-    sync_cfg = cfg.get("sync") or {}
-    if not sync_cfg.get("blame", True):
+    if not (cfg.get("sync") or {}).get("blame", True):
         return
-    try:
-        import git
-    except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("缺少 GitPython：pip install gitpython") from exc
-
     index = _project_index(cfg)
     grouped = {}
     for leak in leaks:
@@ -577,24 +670,30 @@ def attach_committers(cfg, leaks, synced_projects, log=print):
         if not project or project_name not in synced_projects:
             continue
         code_path = str(project.get("local_path") or "").strip()
-        try:
-            repo = git.Repo(code_path)
-        except Exception as exc:
-            log(f"[blame] {project_name}: 打开本地仓库失败（{exc}）")
-            continue
         for leak in items:
             line_number = leak.get("lineNumber")
             relative = leak.get("relativePath")
             if not relative or line_number in (None, "", "Various"):
                 continue
-            command = ["git", "blame", "-L", f"{line_number},{line_number}", "--", "./" + relative]
             try:
-                output = execute_command(command, code_path).strip()
-                if output:
-                    commit = repo.commit(output.split()[0])
-                    leak["committer"] = commit.committer.name
-            except Exception:
-                log(f"[blame] {project_name}: {relative}:{line_number} 未找到提交者")
+                rc, out, _ = run_git(
+                    cfg,
+                    code_path,
+                    ["blame", "-L", f"{line_number},{line_number}", "--", "./" + relative],
+                    timeout=60,
+                    check=False,
+                )
+                if rc != 0 or not out.strip():
+                    log(f"[blame] {project_name}: {relative}:{line_number} 未找到提交者")
+                    continue
+                sha = out.split()[0].lstrip("^")
+                rc, author, _ = run_git(
+                    cfg, code_path, ["show", "-s", "--format=%cn", sha], timeout=30, check=False
+                )
+                if rc == 0 and author.strip():
+                    leak["committer"] = author.strip()
+            except Exception as exc:
+                log(f"[blame] {project_name}: {relative}:{line_number} 查询失败（{exc}）")
 
 
 # --------------------------------------------------------------------------- #
@@ -857,7 +956,23 @@ def build_parser():
     return parser
 
 
+def _enable_line_buffering(stream=None):
+    """让进度日志实时输出。
+
+    输出被管道或重定向时 Python 默认用块缓冲，长任务的进度日志会攒到最后才
+    出现。sys.stdout 的标注类型是 TextIO，而 reconfigure 只定义在
+    io.TextIOWrapper 上，所以先做类型判断再调用。
+    """
+    stream = stream if stream is not None else sys.stdout
+    if isinstance(stream, io.TextIOWrapper):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (ValueError, OSError):
+            pass
+
+
 def main(argv=None):
+    _enable_line_buffering()
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command is None:

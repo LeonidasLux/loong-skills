@@ -13,7 +13,7 @@ metadata:
 
 ## 环境
 
-- 依赖 `python3`，以及 `requests`、`pyyaml`、`gitpython`。
+- 依赖 `python3`（`requests`、`pyyaml`）与命令行 `git`。
 - 项目与平台配置在 `config/config.yaml`（含 cookie/csrf，已被 `.gitignore` 忽略）；字段说明与模板见 `config/config.example.yaml`。
 - 下列命令都在技能根目录执行。
 
@@ -36,7 +36,7 @@ python3 scripts/scan_leaks.py check
 python3 scripts/scan_leaks.py scan
 ```
 
-- 脚本会先同步本地仓库（stash → pull → 检出配置分支 → pull），再抓取缺陷，并用 `git blame` 补全提交者。
+- 脚本会先同步本地仓库（按需 stash → 检出配置分支 → pull），再抓取缺陷，并用 `git blame` 补全提交者。每条 git 命令都有超时（`sync.timeout`，默认 180 秒）并带 ssh 保活，远端静默不会让扫描挂死：拉取失败只在 `warnings` 里报告，该仓库降级为按本地现有代码分析。
 - 用户不希望改动本地仓库时加 `--no-sync`；只想看某个仓库时加 `--project <仓库名>`；需要完整 JSON 时加 `--json`。
 - 结果 JSON/CSV 默认写到命令运行时的当前目录，可用 `output.dir` 或 `--out-dir <目录>` 指定；JSON 含 `summary`、`leaks`、`warnings`，字段说明见 `references/workflow.md`。在会话中执行时建议把 `--out-dir` 指到本次任务的临时目录，避免产物留在仓库工作区。
 
