@@ -23,7 +23,7 @@ declare -A AGENT_PATHS=(
   ["claude-code"]="$HOME/.claude/skills"
   ["codex"]="$HOME/.codex/skills"
   ["co-mind"]="$HOME/.icodemate/cli/skills $HOME/.icodemate/skills"
-  ["openclaw"]="$HOME/.icodemate/cli/skills $HOME/.openclaw/workspace/skills"
+  ["openclaw"]="$HOME/.openclaw/workspace/skills"
 )
 
 # agent 在界面里的展示顺序（没列出来的 agent 会自动追加到末尾）
