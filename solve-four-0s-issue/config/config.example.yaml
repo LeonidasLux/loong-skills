@@ -1,0 +1,75 @@
+# ============================================================================
+# solve-four-0s-issue 技能配置模板
+# ----------------------------------------------------------------------------
+# 使用方式：
+#   1. 复制为同目录下的 config.yaml：cp config.example.yaml config.yaml
+#   2. 填写 cca.cookie / cca.csrf，以及 projects 下每个项目的本地路径与任务 ID
+#   3. 执行校验：python3 scripts/scan_leaks.py check
+#
+# config.yaml 已被 .gitignore 忽略（内含凭据，禁止提交）。
+# 也可以用环境变量提供凭据，避免把 cookie 写进文件：
+#   export FOUR0S_CCA_COOKIE='...' ; export FOUR0S_CCA_CSRF='...'
+# ============================================================================
+
+# CCA 平台与「4个0」判定口径
+cca:
+  # CCA 平台地址
+  base_url: "https://cca.zte.com.cn"
+  # CCA 项目 ID（任务链接 /workbench/project/<project_id>/task/... 中的一段）
+  project_id: "<project-id>"
+  # 登录 CCA 后从浏览器复制出来的完整 Cookie
+  cookie: "<cookie>"
+  # 请求头 x-csrf-token，浏览器开发者工具中获取
+  csrf: "<csrf>"
+
+  # Klocwork 相关口径
+  kw:
+    # Klocwork 任务接口使用的 tool 参数
+    tool: "kwServer-2020.4"
+    # 需要清零的优先级
+    priorities: ["Critical", "Error"]
+    # 只统计以下状态的缺陷（Analyze 表示待分析/未处理）
+    status_filter: ["Analyze"]
+
+  # Coverity 相关口径
+  coverity:
+    # Coverity 任务接口使用的 tool 参数
+    tool: "coverity-20230302"
+    # 需要清零的优先级
+    priorities: ["High", "Medium"]
+    # true 时只统计 classification=Unclassified（未分类）的缺陷
+    only_unclassified: true
+
+# 需要扫描的项目列表
+# 每个项目对应 CCA 上一个 Klocwork 任务和一个 Coverity 任务：
+#   任务 ID 取自任务链接 https://cca.zte.com.cn/workbench/project/<project_id>/task/<任务ID>/...
+projects:
+  - name: "<仓库名，需与 CCA 返回文件路径中的仓库目录名一致>"
+    local_path: "<本地仓库绝对路径>"
+    branch: "develop"                  # 本地仓库需检出并固定的分支
+    kw_id: "<Klocwork 任务 ID>"         # 无 Klocwork 任务时留空 ""
+    coverity_id: "<Coverity 任务 ID>"   # 无 Coverity 任务时留空 ""
+    enabled: true                      # false 表示本次扫描跳过该项目
+  # - name: "another-repo"
+  #   local_path: "/path/to/another-repo"
+  #   branch: "release_x"
+  #   kw_id: ""
+  #   coverity_id: "<Coverity 任务 ID>"
+
+# 扫描前的本地仓库同步
+sync:
+  enabled: true              # false 时不 stash/pull/checkout，直接分析当前工作区
+  stash_before_pull: true    # 拉取前先 git stash，避免本地改动阻塞
+  pull: true                 # 是否在检出分支前后 pull 远端
+  blame: true                # 是否用 git blame 查询缺陷提交者
+
+# 扫描结果输出（本项可以不配置）
+# 留空或缺省时，结果写到执行 scan 命令时的当前目录；
+# 需要固定输出位置或指向临时目录时再填绝对路径。
+# output:
+#   dir: "/path/to/scan-results"
+
+# 网络请求参数
+request:
+  timeout: 60                # 单次 HTTP 请求超时（秒）
+  retries: 2                 # 失败重试次数

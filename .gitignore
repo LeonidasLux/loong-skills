@@ -1,0 +1,11 @@
+# Python 产物
+__pycache__/
+*.pyc
+
+# 技能本地私密配置（含 cookie/csrf 等凭据，禁止提交）
+solve-four-0s-issue/config/config.yaml
+solve-four-0s-issue/config/*.local.yaml
+
+# 扫描结果（默认输出到执行命令时的当前目录，兜底忽略技能目录下的产物）
+solve-four-0s-issue/leaks_result_*
+solve-four-0s-issue/**/leaks_result_*
