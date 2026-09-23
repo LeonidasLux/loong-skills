@@ -9,8 +9,8 @@
     4. Coverity Medium
 
 子命令：
-    check         校验配置完整性，并用 CCA 接口验证 cookie 是否有效
-    check-cookie  只验证 cookie 是否有效
+    check         校验配置完整性，并用 CCA 接口验证凭据是否有效
+    check-auth    只验证凭据是否有效（旧名 check-cookie 仍可用）
     scan          扫描项目并输出 JSON/CSV 结果（默认子命令）
 
 用法示例：
@@ -19,12 +19,20 @@
     python3 scripts/scan_leaks.py scan --no-sync --json
     python3 scripts/scan_leaks.py scan --fail-on-leak
 
+CCA 接口：统一调用开放 API（<base_url>/api/v2），请求头只带两个鉴权参数
+X-Emp-No + X-Uac-Token，不再需要浏览器 Cookie / x-csrf-token。
+
+凭据（员工号 + UAC token）来源，按优先级：
+    1. 命令行 --emp-no / --uac-token
+    2. 环境变量 FOUR0S_CCA_EMP_NO / FOUR0S_CCA_UAC_TOKEN
+    3. OpenClaw 注入的环境变量 coclaw_empno / coclaw_token
+    4. 配置文件 <skill>/config/config.yaml 的 cca.emp_no / cca.uac_token
+
 配置文件默认路径为 <skill>/config/config.yaml，可用 --config 或环境变量
-FOUR0S_CONFIG 覆盖；凭据可用 FOUR0S_CCA_COOKIE / FOUR0S_CCA_CSRF 覆盖，
-避免把 cookie 写进文件。
+FOUR0S_CONFIG 覆盖。
 
 退出码：0 成功；1 扫描到非 0 问题（仅 --fail-on-leak）；2 配置不完整；
-3 cookie 无效；4 运行过程中出错。
+3 凭据无效；4 运行过程中出错。
 """
 
 import argparse
@@ -43,44 +51,44 @@ from pathlib import Path
 import requests
 import yaml
 
+try:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+except ImportError:
+    pass
+
 SKILL_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG_PATH = SKILL_ROOT / "config" / "config.yaml"
 
-USER_AGENT = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/89.0.4389.90 Safari/537.36"
-)
-CCA_AUTHORITY = "cca.zte.com.cn"
+# CCA 开放 API（/api/v2）：只认 X-Emp-No + X-Uac-Token 两个请求头鉴权
+CCA_API_PREFIX = "/api/v2"
+# 问题列表接口单页上限 500 条，超过需翻页
+ISSUE_PAGE_SIZE = 500
+# 单次 HTTP 超时默认值（秒），可被配置项 request.timeout 覆盖
+DEFAULT_HTTP_TIMEOUT = 60
 
-# CCA 缺陷列表接口是 datatables 风格，必须带完整的 columns 参数；
-# 参数不全接口会直接返回 400 Bad Request。
-EXECUTION_COLUMNS = [
-    ("name", True),
-    ("startTime", True),
-    ("endTime", True),
-    ("waitTime", True),
-    ("executionTime", True),
-    ("buildVersion", True),
-    ("status", False),
-    ("progress", False),
-    ("remark", False),
-    ("scanMethod", False),
-    ("shortId", False),
-    ("shortId", False),
-]
-ISSUE_COLUMNS = [
-    ("sn", True),
-    ("title", True),
-    ("priorityDescription", True),
-    ("3", True),
-    ("4", False),
-    ("5", False),
-]
+# 凭据环境变量：FOUR0S_* 为本技能专用；coclaw_* 由 OpenClaw 注入
+ENV_EMP_NO = "FOUR0S_CCA_EMP_NO"
+ENV_UAC_TOKEN = "FOUR0S_CCA_UAC_TOKEN"
+OPENCLAW_ENV_EMP_NO = "coclaw_empno"
+OPENCLAW_ENV_UAC_TOKEN = "coclaw_token"
 
 # 判定「未配置」的占位符，避免把模板值当成真实配置
-PLACEHOLDER_VALUES = {"", "todo", "tbd", "none", "null", "cookie", "csrf", "change-me"}
+PLACEHOLDER_VALUES = {
+    "",
+    "todo",
+    "tbd",
+    "none",
+    "null",
+    "cookie",
+    "csrf",
+    "token",
+    "empno",
+    "emp_no",
+    "change-me",
+}
 PLACEHOLDER_PREFIXES = ("<", "your-", "xxx")
-# 命中这些关键字的重定向说明会话已失效
+# 命中这些关键字的重定向说明鉴权已失效（被重定向到登录页）
 LOGIN_HINTS = ("authorizeurl", "/login", "sso")
 
 CSV_HEADER = ["提交者", "代码库", "文件路径", "行数", "漏洞描述", "漏洞类型", "漏洞ID", "漏洞级别", "任务链接"]
@@ -100,8 +108,17 @@ def _is_placeholder(value):
     return text.lower().startswith(PLACEHOLDER_PREFIXES)
 
 
+def _first_env(*names):
+    """按顺序返回第一个非空环境变量的值。"""
+    for name in names:
+        value = os.environ.get(name)
+        if value:
+            return value
+    return ""
+
+
 def load_config(config_path):
-    """加载并规范化配置；凭据允许用环境变量覆盖。"""
+    """加载并规范化配置；凭据允许用环境变量（含 OpenClaw 注入）覆盖。"""
     path = Path(config_path).expanduser().resolve()
     if not path.is_file():
         raise ConfigError(
@@ -121,26 +138,33 @@ def load_config(config_path):
     if not isinstance(cfg.get("projects"), list):
         cfg["projects"] = []
 
-    cookie = os.environ.get("FOUR0S_CCA_COOKIE") or cfg["cca"].get("cookie")
-    csrf = os.environ.get("FOUR0S_CCA_CSRF") or cfg["cca"].get("csrf")
-    cfg["cca"]["cookie"] = (cookie or "").strip()
-    cfg["cca"]["csrf"] = (csrf or "").strip()
+    # 凭据优先级：环境变量（本技能专用 / OpenClaw 注入）> config.yaml
+    emp_no = _first_env(ENV_EMP_NO, OPENCLAW_ENV_EMP_NO) or cfg["cca"].get("emp_no")
+    uac_token = _first_env(ENV_UAC_TOKEN, OPENCLAW_ENV_UAC_TOKEN) or cfg["cca"].get("uac_token")
+    cfg["cca"]["emp_no"] = str(emp_no or "").strip()
+    cfg["cca"]["uac_token"] = str(uac_token or "").strip()
     cfg["_config_path"] = str(path)
     return cfg
 
 
 def validate_config(cfg):
-    """返回配置问题列表；空列表表示配置完整（不校验 cookie 是否仍然有效）。"""
+    """返回配置问题列表；空列表表示配置完整（不校验凭据是否仍然有效）。"""
     errors = []
     cca = cfg["cca"]
     if _is_placeholder(cca.get("base_url")):
         errors.append("cca.base_url 未配置")
     if _is_placeholder(cca.get("project_id")):
         errors.append("cca.project_id 未配置（任务链接中 /workbench/project/<project_id>/ 一段）")
-    if _is_placeholder(cca.get("cookie")):
-        errors.append("cca.cookie 未配置（可用环境变量 FOUR0S_CCA_COOKIE 提供）")
-    if _is_placeholder(cca.get("csrf")):
-        errors.append("cca.csrf 未配置（可用环境变量 FOUR0S_CCA_CSRF 提供）")
+    if _is_placeholder(cca.get("emp_no")):
+        errors.append(
+            "cca.emp_no 未配置（可用 OpenClaw 注入的 coclaw_empno，"
+            f"或环境变量 {ENV_EMP_NO}，或命令行 --emp-no）"
+        )
+    if _is_placeholder(cca.get("uac_token")):
+        errors.append(
+            "cca.uac_token 未配置（可用 OpenClaw 注入的 coclaw_token，"
+            f"或环境变量 {ENV_UAC_TOKEN}，或命令行 --uac-token）"
+        )
     if not (cca.get("kw") or {}).get("priorities"):
         errors.append("cca.kw.priorities 未配置")
     if not (cca.get("coverity") or {}).get("priorities"):
@@ -210,201 +234,159 @@ def _base_url(cca):
     return str(cca.get("base_url") or "").rstrip("/")
 
 
-def build_session(cfg):
-    session = requests.Session()
-    session.headers.update(
-        {
-            "user-agent": USER_AGENT,
-            "cookie": cfg["cca"]["cookie"],
-            "authority": CCA_AUTHORITY,
-            "accept": "application/json, text/javascript, */*; q=0.01",
-            "x-csrf-token": cfg["cca"]["csrf"],
-        }
-    )
-    return session
+def build_auth_headers(cfg):
+    """CCA 开放 API 请求头：只带 X-Emp-No + X-Uac-Token 两个鉴权参数。"""
+    cca = cfg["cca"]
+    return {
+        "X-Emp-No": str(cca.get("emp_no") or "").strip(),
+        "X-Uac-Token": str(cca.get("uac_token") or "").strip(),
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
 
 
-def _request(session, url, cfg, params=None, allow_redirects=True):
-    """带超时与重试的 GET；不会打印 cookie。"""
+def cca_api_get(cfg, path, params=None):
+    """调用 CCA 开放 API（GET <base_url>/api/v2/...），返回响应体中的 data 字段。
+
+    Args:
+        cfg: 已加载的配置
+        path: /api/v2 之后的路径，如
+            /project/{projectShortId}/task/{taskShortId}/executions
+        params: 查询参数；会自动补上开放 API 必传的 username（员工号）
+
+    Returns:
+        data 字段内容（dict 或 list）
+
+    Raises:
+        RuntimeError: 缺少凭据、HTTP 状态异常、响应体为空，或接口返回错误码（data 为 null）
+    """
+    cca = cfg["cca"]
+    emp_no = str(cca.get("emp_no") or "").strip()
+    uac_token = str(cca.get("uac_token") or "").strip()
+    if not emp_no or not uac_token:
+        raise RuntimeError(
+            "缺少 CCA 凭据（X-Emp-No/X-Uac-Token）："
+            f"请在 OpenClaw 中运行（读取注入的 {OPENCLAW_ENV_EMP_NO}/{OPENCLAW_ENV_UAC_TOKEN}），"
+            f"或设置 {ENV_EMP_NO}/{ENV_UAC_TOKEN}，"
+            "或写入 config.yaml 的 cca.emp_no / cca.uac_token"
+        )
+
+    url = _base_url(cca) + CCA_API_PREFIX + path
+    query = dict(params or {})
+    # 开放 API 的 username（员工号）必传，接口缺该参数会直接报错
+    query.setdefault("username", emp_no)
+
     request_cfg = cfg.get("request") or {}
-    timeout = request_cfg.get("timeout", 60)
+    timeout = request_cfg.get("timeout", DEFAULT_HTTP_TIMEOUT)
     retries = int(request_cfg.get("retries", 2) or 0)
     last_error = None
     for attempt in range(retries + 1):
         try:
-            return session.get(
-                url, params=params, timeout=timeout, allow_redirects=allow_redirects
+            response = requests.get(
+                url,
+                headers=build_auth_headers(cfg),
+                params=query,
+                verify=False,
+                timeout=timeout,
             )
         except requests.RequestException as exc:
             last_error = exc
             if attempt < retries:
                 time.sleep(1.5 * (attempt + 1))
+            continue
+
+        body = response.text or ""
+        if response.status_code in (401, 403):
+            raise RuntimeError(
+                f"CCA 凭据无效或权限不足（HTTP {response.status_code}）：{url}"
+            )
+        location = response.headers.get("location", "")
+        if response.status_code in (301, 302, 303, 307, 308) and any(
+            hint in location.lower() for hint in LOGIN_HINTS
+        ):
+            raise RuntimeError(f"CCA 凭据已失效：请求被重定向到登录页（{location}）")
+        if response.status_code != 200 or not body.strip():
+            raise RuntimeError(
+                f"CCA API 请求失败: url={url}, status={response.status_code}, "
+                f"body[:500]={body[:500]!r}"
+            )
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"CCA API 返回非 JSON（可能被登录页或网关拦截）: url={url}, "
+                f"body[:300]={body[:300]!r}"
+            ) from exc
+        if not isinstance(payload, dict) or payload.get("data") is None:
+            raise RuntimeError(f"CCA API 返回异常: url={url}, body={body[:500]!r}")
+        return payload["data"]
+
     raise RuntimeError(f"请求 CCA 失败：{url}（{type(last_error).__name__}: {last_error}）")
 
 
-def _datatables_columns(columns):
-    params = []
-    for index, (data, orderable) in enumerate(columns):
-        params += [
-            (f"columns[{index}][data]", data),
-            (f"columns[{index}][name]", ""),
-            (f"columns[{index}][searchable]", "true"),
-            (f"columns[{index}][orderable]", "true" if orderable else "false"),
-            (f"columns[{index}][search][value]", ""),
-            (f"columns[{index}][search][regex]", "false"),
-        ]
-    return params
-
-
-def _executions_params(length=200):
-    return (
-        [("draw", "1")]
-        + _datatables_columns(EXECUTION_COLUMNS)
-        + [
-            ("order[0][column]", "1"),
-            ("order[0][dir]", "desc"),
-            ("start", "0"),
-            ("length", str(length)),
-            ("search[value]", ""),
-            ("search[regex]", "false"),
-            ("_", str(int(time.time() * 1000))),
-        ]
+def get_latest_record(cfg, task_id, label):
+    """取任务最近一次执行的记录（按开始时间倒序的第一条）。"""
+    data = cca_api_get(
+        cfg,
+        f"/project/{cfg['cca']['project_id']}/task/{task_id}/executions",
+        {"start": 0, "length": 1, "order": "desc", "sort": "startTime"},
     )
+    records = (data or {}).get("data") or []
+    if not records:
+        raise RuntimeError(f"{label} 任务 {task_id} 没有查询到执行记录")
+    return records[0]
 
 
-def _issues_params(tool, priority, draw="2", order_column="2", length=200):
-    return (
-        [("reportId", ""), ("tool", tool), ("priority", priority), ("draw", draw)]
-        + _datatables_columns(ISSUE_COLUMNS)
-        + [
-            ("order[0][column]", order_column),
-            ("order[0][dir]", "asc"),
-            ("start", "0"),
-            ("length", str(length)),
-            ("search[value]", ""),
-            ("search[regex]", "false"),
-            ("_", str(int(time.time() * 1000))),
-        ]
-    )
+def get_latest_record_id(cfg, task_id, label):
+    """取任务最近一次执行的记录 ID（shortId）。"""
+    return get_latest_record(cfg, task_id, label).get("shortId")
 
 
-def _executions_url(cfg, task_id):
-    cca = cfg["cca"]
-    return f"{_base_url(cca)}/workbench/project/{cca['project_id']}/task/{task_id}/executions"
+def fetch_issues(cfg, task_id, record_id):
+    """翻页拉取某次执行下的全部问题明细（单页上限 ISSUE_PAGE_SIZE）。"""
+    issues = []
+    start = 0
+    while True:
+        data = cca_api_get(
+            cfg,
+            f"/project/{cfg['cca']['project_id']}/task/{task_id}"
+            f"/execution/{record_id}/issues",
+            {
+                "start": start,
+                "length": ISSUE_PAGE_SIZE,
+                "order": "asc",
+                "sort": "sn",
+                "filter": "",
+            },
+        )
+        page = (data or {}).get("data") or []
+        issues.extend(page)
+        start += len(page)
+        total = (data or {}).get("recordsTotal") or 0
+        if not page or (total and len(issues) >= total):
+            break
+    return issues
 
 
-def _issues_url(cfg, task_id, record_id):
-    cca = cfg["cca"]
-    return (
-        f"{_base_url(cca)}/workbench/project/{cca['project_id']}"
-        f"/task/{task_id}/execution/{record_id}/issues"
-    )
-
-
-def check_cookie(cfg, task_id=None):
-    """调用 CCA 接口验证 cookie 是否有效（不跟随重定向，登录跳转即视为失效）。"""
-    cca = cfg["cca"]
+def check_auth(cfg, task_id=None):
+    """调用 CCA 开放 API 验证凭据（X-Emp-No/X-Uac-Token）是否可用。"""
     task_id = task_id or _first_task_id(cfg)
     if not task_id:
         return {
             "ok": False,
-            "reason": "没有可用的任务 ID，无法验证 cookie：请先配置 projects[].kw_id 或 coverity_id",
+            "reason": "没有可用的任务 ID，无法验证凭据：请先配置 projects[].kw_id 或 coverity_id",
         }
-    url = _executions_url(cfg, task_id)
-    session = build_session(cfg)
     try:
-        resp = _request(
-            session, url, cfg, params=_executions_params(length=1), allow_redirects=False
-        )
+        record = get_latest_record(cfg, task_id, "凭据校验")
     except RuntimeError as exc:
         return {"ok": False, "reason": str(exc), "task": task_id}
-
-    location = resp.headers.get("location", "")
-    if resp.status_code in (301, 302, 303, 307, 308) and any(
-        hint in location.lower() for hint in LOGIN_HINTS
-    ):
-        return {
-            "ok": False,
-            "reason": "cookie 已失效：请求被重定向到登录页，请更新 config.yaml 中的 cca.cookie 与 cca.csrf",
-            "status": resp.status_code,
-            "task": task_id,
-        }
-    if resp.status_code in (401, 403):
-        return {
-            "ok": False,
-            "reason": f"cookie 无效或权限不足（HTTP {resp.status_code}）",
-            "status": resp.status_code,
-            "task": task_id,
-        }
-    if resp.status_code != 200:
-        return {
-            "ok": False,
-            "reason": f"CCA 接口返回异常状态码 {resp.status_code}",
-            "status": resp.status_code,
-            "body": resp.text[:200],
-            "task": task_id,
-        }
-    try:
-        payload = resp.json()
-    except ValueError:
-        return {
-            "ok": False,
-            "reason": "CCA 接口未返回 JSON，可能被登录页或网关拦截",
-            "body": resp.text[:200],
-            "task": task_id,
-        }
-    if not isinstance(payload, dict) or "data" not in payload:
-        return {
-            "ok": False,
-            "reason": "CCA 接口返回内容缺少 data 字段，cookie 可能已失效",
-            "body": resp.text[:200],
-            "task": task_id,
-        }
     return {
         "ok": True,
-        "reason": "cookie 有效",
-        "status": 200,
+        "reason": "凭据有效",
         "task": task_id,
-        "executionRecords": len(payload.get("data") or []),
+        "executionShortId": record.get("shortId"),
+        "executionStatus": record.get("status"),
     }
-
-
-def get_latest_record_id(session, cfg, task_id, label):
-    """取任务最近一次执行的记录 ID（shortId）。"""
-    resp = _request(
-        session, _executions_url(cfg, task_id), cfg, params=_executions_params(length=1)
-    )
-    if resp.status_code != 200 or not resp.text.strip():
-        raise RuntimeError(
-            f"{label} executions 请求失败：task={task_id}, status={resp.status_code}, "
-            f"body[:300]={resp.text[:300]!r}"
-        )
-    records = (json.loads(resp.text) or {}).get("data") or []
-    if not records:
-        raise RuntimeError(f"{label} 任务 {task_id} 没有任何执行记录")
-    return records[0]["shortId"]
-
-
-def fetch_issues(session, cfg, task_id, record_id, tool, priority, draw="2"):
-    resp = _request(
-        session,
-        _issues_url(cfg, task_id, record_id),
-        cfg,
-        params=_issues_params(tool, priority, draw=draw),
-    )
-    if resp.status_code != 200 or not resp.text.strip():
-        raise RuntimeError(
-            f"CCA issues 请求失败：task={task_id}, priority={priority}, "
-            f"status={resp.status_code}, body[:300]={resp.text[:300]!r}"
-        )
-    try:
-        payload = json.loads(resp.text)
-    except ValueError as exc:
-        raise RuntimeError(
-            f"CCA issues 返回非 JSON：task={task_id}, priority={priority}, "
-            f"body[:300]={resp.text[:300]!r}"
-        ) from exc
-    return payload.get("data") or []
 
 
 # --------------------------------------------------------------------------- #
@@ -460,41 +442,41 @@ def build_leak(issue, project, leak_type, cfg, task_id, record_id):
     }
 
 
-def get_kw_leaks(session, cfg, project):
-    """抓取单个项目的 Klocwork 缺陷（仅未处理的 Critical/Error）。"""
+def get_kw_leaks(cfg, project):
+    """抓取单个项目的 Klocwork 缺陷（仅配置状态的 Critical/Error）。"""
     task_id = str(project.get("kw_id") or "").strip()
     if not task_id:
         return []
     kw_cfg = cfg["cca"].get("kw") or {}
-    tool = kw_cfg.get("tool", "kwServer-2020.4")
+    levels = set(kw_cfg.get("priorities") or [])
     status_filter = set(kw_cfg.get("status_filter") or [])
-    record_id = get_latest_record_id(session, cfg, task_id, f"{project.get('name')} Klocwork")
+    record_id = get_latest_record_id(cfg, task_id, f"{project.get('name')} Klocwork")
     leaks = []
-    for level in kw_cfg.get("priorities") or []:
-        for issue in fetch_issues(session, cfg, task_id, record_id, tool, level, draw="2"):
-            if status_filter and issue.get("status") not in status_filter:
-                continue
-            leaks.append(build_leak(issue, project, "Klocwork", cfg, task_id, record_id))
+    for issue in fetch_issues(cfg, task_id, record_id):
+        if issue.get("priorityDescription") not in levels:
+            continue
+        if status_filter and issue.get("status") not in status_filter:
+            continue
+        leaks.append(build_leak(issue, project, "Klocwork", cfg, task_id, record_id))
     return leaks
 
 
-def get_cov_leaks(session, cfg, project):
+def get_cov_leaks(cfg, project):
     """抓取单个项目的 Coverity 缺陷（仅未分类的 High/Medium）。"""
     task_id = str(project.get("coverity_id") or "").strip()
     if not task_id:
         return []
     cov_cfg = cfg["cca"].get("coverity") or {}
-    tool = cov_cfg.get("tool", "coverity-20230302")
+    levels = set(cov_cfg.get("priorities") or [])
     only_unclassified = cov_cfg.get("only_unclassified", True)
-    record_id = get_latest_record_id(
-        session, cfg, task_id, f"{project.get('name')} Coverity"
-    )
+    record_id = get_latest_record_id(cfg, task_id, f"{project.get('name')} Coverity")
     leaks = []
-    for level in cov_cfg.get("priorities") or []:
-        for issue in fetch_issues(session, cfg, task_id, record_id, tool, level, draw="3"):
-            if only_unclassified and issue.get("classification") != "Unclassified":
-                continue
-            leaks.append(build_leak(issue, project, "Coverity", cfg, task_id, record_id))
+    for issue in fetch_issues(cfg, task_id, record_id):
+        if issue.get("priorityDescription") not in levels:
+            continue
+        if only_unclassified and issue.get("classification") != "Unclassified":
+            continue
+        leaks.append(build_leak(issue, project, "Coverity", cfg, task_id, record_id))
     return leaks
 
 
@@ -803,26 +785,30 @@ def cmd_check(cfg, _args):
         return 2
     print("配置检查：通过（平台、项目、分支、任务 ID 均已配置）")
 
-    result = check_cookie(cfg)
+    result = check_auth(cfg)
     if not result["ok"]:
-        print(f"cookie 检查：不通过 —— {result['reason']}")
+        print(f"凭据检查：不通过 —— {result['reason']}")
         return 3
     print(
-        f"cookie 检查：有效（校验任务 {result['task']}，"
-        f"返回 {result.get('executionRecords', 0)} 条执行记录）"
+        f"凭据检查：有效（校验任务 {result['task']}，"
+        f"最近一次执行 {result.get('executionShortId')}，状态 {result.get('executionStatus')}）"
     )
     return 0
 
 
-def cmd_check_cookie(cfg, _args):
-    if _is_placeholder(cfg["cca"].get("cookie")):
-        print("cookie 检查：不通过 —— cca.cookie 未配置")
+def cmd_check_auth(cfg, _args):
+    if _is_placeholder(cfg["cca"].get("emp_no")) or _is_placeholder(cfg["cca"].get("uac_token")):
+        print(
+            "凭据检查：不通过 —— cca.emp_no / cca.uac_token 未配置"
+            "（可用 OpenClaw 注入的 coclaw_empno / coclaw_token，"
+            f"或环境变量 {ENV_EMP_NO} / {ENV_UAC_TOKEN}，或命令行 --emp-no / --uac-token）"
+        )
         return 2
-    result = check_cookie(cfg)
+    result = check_auth(cfg)
     if not result["ok"]:
-        print(f"cookie 检查：不通过 —— {result['reason']}")
+        print(f"凭据检查：不通过 —— {result['reason']}")
         return 3
-    print(f"cookie 检查：有效（校验任务 {result['task']}）")
+    print(f"凭据检查：有效（校验任务 {result['task']}）")
     return 0
 
 
@@ -834,12 +820,16 @@ def cmd_scan(cfg, args):
         return 2
     print("配置检查：通过")
 
-    auth = check_cookie(cfg)
+    auth = check_auth(cfg)
     if not auth["ok"]:
-        print(f"cookie 检查：不通过 —— {auth['reason']}")
-        print("请更新 config.yaml 中的 cca.cookie 与 cca.csrf 后重试。")
+        print(f"凭据检查：不通过 —— {auth['reason']}")
+        print(
+            f"请在 OpenClaw 中运行（读取注入的 coclaw_empno/coclaw_token），"
+            f"或设置环境变量 {ENV_EMP_NO}/{ENV_UAC_TOKEN}，"
+            "或 config.yaml 的 cca.emp_no/cca.uac_token 提供有效凭据后重试。"
+        )
         return 3
-    print(f"cookie 检查：有效（校验任务 {auth['task']}）")
+    print(f"凭据检查：有效（校验任务 {auth['task']}）")
 
     projects = _enabled_projects(cfg, set(args.project) if args.project else None)
     if not projects:
@@ -847,17 +837,16 @@ def cmd_scan(cfg, args):
         return 2
     print(f"开始扫描 {len(projects)} 个项目：{', '.join(str(p['name']) for p in projects)}")
 
-    session = build_session(cfg)
     leaks, warnings = [], []
     for project in projects:
         name = str(project.get("name") or "")
         try:
-            kw_leaks = get_kw_leaks(session, cfg, project)
+            kw_leaks = get_kw_leaks(cfg, project)
         except Exception as exc:
             kw_leaks = []
             warnings.append(f"{name} Klocwork 抓取失败：{exc}")
         try:
-            cov_leaks = get_cov_leaks(session, cfg, project)
+            cov_leaks = get_cov_leaks(cfg, project)
         except Exception as exc:
             cov_leaks = []
             warnings.append(f"{name} Coverity 抓取失败：{exc}")
@@ -933,7 +922,10 @@ def cmd_scan(cfg, args):
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="scan_leaks.py",
-        description="CCA「4个0」问题扫描：校验配置与 cookie，抓取 Klocwork/Coverity 未处理高优先级问题。",
+        description=(
+            "CCA「4个0」问题扫描：校验配置与凭据，抓取 Klocwork/Coverity "
+            "未处理高优先级问题（走 CCA 开放 API，仅需 X-Emp-No + X-Uac-Token）。"
+        ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -941,9 +933,18 @@ def build_parser():
         default=os.environ.get("FOUR0S_CONFIG") or str(DEFAULT_CONFIG_PATH),
         help=f"配置文件路径（默认 {DEFAULT_CONFIG_PATH}）",
     )
+    parser.add_argument(
+        "--emp-no",
+        help="CCA 员工号（X-Emp-No），默认取环境变量（含 OpenClaw 注入）或配置 cca.emp_no",
+    )
+    parser.add_argument(
+        "--uac-token",
+        help="CCA UAC token（X-Uac-Token），默认取环境变量（含 OpenClaw 注入）或配置 cca.uac_token",
+    )
     subparsers = parser.add_subparsers(dest="command")
-    subparsers.add_parser("check", help="校验配置完整性并验证 cookie")
-    subparsers.add_parser("check-cookie", help="只验证 cookie 是否有效")
+    subparsers.add_parser("check", help="校验配置完整性并验证凭据")
+    subparsers.add_parser("check-auth", help="只验证凭据（X-Emp-No/X-Uac-Token）是否有效")
+    subparsers.add_parser("check-cookie", help="check-auth 的旧名称，行为相同")
     scan = subparsers.add_parser("scan", help="扫描缺陷并输出结果（默认子命令）")
     scan.add_argument("--project", action="append", help="只扫描指定项目，可重复")
     scan.add_argument("--no-sync", action="store_true", help="跳过 stash/pull/checkout")
@@ -988,10 +989,16 @@ def main(argv=None):
     except ConfigError as exc:
         print(str(exc))
         return 2
+    # 命令行凭据优先级最高
+    if getattr(args, "emp_no", None):
+        cfg["cca"]["emp_no"] = args.emp_no.strip()
+    if getattr(args, "uac_token", None):
+        cfg["cca"]["uac_token"] = args.uac_token.strip()
 
     handlers = {
         "check": cmd_check,
-        "check-cookie": cmd_check_cookie,
+        "check-auth": cmd_check_auth,
+        "check-cookie": cmd_check_auth,
         "scan": cmd_scan,
     }
     try:

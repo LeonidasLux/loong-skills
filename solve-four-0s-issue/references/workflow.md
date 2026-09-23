@@ -6,9 +6,9 @@
 
 | 路径 | 职责 |
 | --- | --- |
-| `config/config.yaml` | 本机真实配置（含 cookie/csrf），已被 `.gitignore` 忽略，**不要提交** |
+| `config/config.yaml` | 本机真实配置（可含 `cca.emp_no` / `cca.uac_token` 凭据），已被 `.gitignore` 忽略，**不要提交** |
 | `config/config.example.yaml` | 配置模板与字段说明，随技能一起版本管理 |
-| `scripts/scan_leaks.py` | 配置校验、cookie 校验、缺陷抓取、结果落盘 |
+| `scripts/scan_leaks.py` | 配置校验、凭据校验、缺陷抓取、结果落盘（走 CCA 开放 API `/api/v2`） |
 | `references/workflow.md` | 本文件：执行细节 |
 | `references/fix-archive.md` | 自进化归档：只记录问题类别与解决方案（已脱敏） |
 
@@ -20,9 +20,8 @@
 | --- | --- |
 | `cca.base_url` | CCA 平台地址，通常为 `https://cca.zte.com.cn` |
 | `cca.project_id` | CCA 项目 ID，取任务链接中 `/workbench/project/<project_id>/` 一段 |
-| `cca.cookie` | 登录 CCA 后浏览器里的完整 Cookie 字符串 |
-| `cca.csrf` | 请求头 `x-csrf-token` 的值 |
-| `cca.kw.tool` / `cca.coverity.tool` | 缺陷列表接口的 `tool` 参数（Klocwork: `kwServer-2020.4`，Coverity: `coverity-20230302`） |
+| `cca.emp_no` | 员工号，作为请求头 `X-Emp-No`；已由技能/环境变量提供时可留空 |
+| `cca.uac_token` | UAC token，作为请求头 `X-Uac-Token`；已由技能/环境变量提供时可留空 |
 | `cca.kw.priorities` | Klocwork 需要清零的优先级，默认 `["Critical", "Error"]` |
 | `cca.coverity.priorities` | Coverity 需要清零的优先级，默认 `["High", "Medium"]` |
 | `cca.kw.status_filter` | 只统计这些状态的 Klocwork 缺陷，默认 `["Analyze"]`（已备案/已处理的不算） |
@@ -42,15 +41,22 @@
 | `output.dir` | 扫描结果（JSON/CSV）输出目录，**可以不配置**；缺省时写到执行 `scan` 命令时的当前目录 |
 | `request.timeout` / `request.retries` | 单请求超时秒数与重试次数 |
 
-获取凭据的方式：浏览器登录 CCA，打开开发者工具 → Network → 任选一个 `cca.zte.com.cn` 请求，复制请求头里的 `Cookie` 与 `x-csrf-token`。
+凭据获取方式（`X-Emp-No` 员工号 + `X-Uac-Token`，按优先级）：
 
-不想把凭据写进文件时，用环境变量覆盖同名配置：
+1. OpenClaw 注入的环境变量 `coclaw_empno` / `coclaw_token`——在 OpenClaw 里运行时通常零配置；
+2. 本技能专用环境变量 `FOUR0S_CCA_EMP_NO` / `FOUR0S_CCA_UAC_TOKEN`；
+3. `config/config.yaml` 的 `cca.emp_no` / `cca.uac_token`；
+4. 命令行 `--emp-no` / `--uac-token`（优先级最高，需写在子命令之前，如 `python3 scripts/scan_leaks.py --uac-token <token> check`）。
+
+不想把凭据写进文件时，用环境变量提供：
 
 ```bash
-export FOUR0S_CCA_COOKIE='<粘贴 cookie>'
-export FOUR0S_CCA_CSRF='<粘贴 csrf>'
+export FOUR0S_CCA_EMP_NO='0668001277'
+export FOUR0S_CCA_UAC_TOKEN='<UAC token>'
 python3 scripts/scan_leaks.py check
 ```
+
+脚本走 CCA 开放 API（`<base_url>/api/v2`），只带 `X-Emp-No` + `X-Uac-Token` 两个鉴权头，浏览器 Cookie / `x-csrf-token` 已不再使用。
 
 任务 ID 与项目 ID 都从 CCA 任务链接里取：`https://cca.zte.com.cn/workbench/project/<project_id>/task/<任务ID>/...`。任务与仓库的对应关系可用扫描结果里的仓库名反向确认（脚本会把不一致写进 `warnings`）。iCenter 上的说明文档需用 `edw` / `edw-space` 技能查阅，不要用 `web-fetch`，例如：
 
@@ -63,8 +69,8 @@ https://i.zte.com.cn/#/shared/45e2844136c54b86a105b695eaef116b/wiki/page/76faeb0
 所有命令都在技能根目录执行（`cd <skill 目录>`）：
 
 ```bash
-python3 scripts/scan_leaks.py check                  # 校验配置完整性 + cookie 是否有效
-python3 scripts/scan_leaks.py check-cookie           # 只校验 cookie
+python3 scripts/scan_leaks.py check                  # 校验配置完整性 + 凭据是否有效
+python3 scripts/scan_leaks.py check-auth             # 只校验凭据（旧名 check-cookie 仍可用）
 python3 scripts/scan_leaks.py scan                   # 全量扫描（默认会同步本地仓库）
 python3 scripts/scan_leaks.py scan --project <仓库名> # 只扫某个仓库，可重复
 python3 scripts/scan_leaks.py scan --no-sync          # 不动本地仓库，只抓取并分析
@@ -73,9 +79,9 @@ python3 scripts/scan_leaks.py scan --fail-on-leak     # 有问题时退出码为
 python3 scripts/scan_leaks.py scan --out-dir /path/to/results  # 指定结果目录
 ```
 
-退出码：`0` 成功；`1` 发现问题（仅 `--fail-on-leak`）；`2` 配置不完整；`3` cookie 无效；`4` 运行出错。
+退出码：`0` 成功；`1` 发现问题（仅 `--fail-on-leak`）；`2` 配置不完整；`3` 凭据无效；`4` 运行出错。
 
-`scan` 会先做配置校验和 cookie 校验，任一不通过都会直接退出，不会抓取数据。
+`scan` 会先做配置校验和凭据校验，任一不通过都会直接退出，不会抓取数据。
 
 同步阶段对每个仓库执行：按需 `git stash`（仅跟踪文件）→ `git checkout <配置分支>` → `git pull --ff-only`。每条命令都有超时（`sync.timeout`，默认 180 秒）并按进程组终止，另外给 ssh 加了保活参数，所以远端 Gerrit 静默时不会无限等待：超时或拉取失败只写进 `warnings`，该仓库降级为按本地现有代码分析，其余仓库继续。注意进度日志在 `scan` 结束前就会实时输出，看到长时间不动时不要急着 kill，先看是否有 `[sync]` 日志。
 
@@ -127,8 +133,9 @@ python3 scripts/scan_leaks.py scan --out-dir /path/to/results  # 指定结果目
 
 | 现象 | 处理 |
 | --- | --- |
-| `cookie 检查：不通过 —— cookie 已失效` | 让用户重新从浏览器复制 Cookie 与 `x-csrf-token`，更新 `config/config.yaml` 或环境变量后重试 |
-| 接口返回 400 Bad Request | 说明请求参数不完整；本脚本已内置 datatables 全量参数，若平台改版需同步更新 `EXECUTION_COLUMNS` / `ISSUE_COLUMNS` |
+| `凭据检查：不通过 —— CCA 凭据无效或权限不足（HTTP 401/403）` | `X-Emp-No` / `X-Uac-Token` 无效或已失效：确认是否在 OpenClaw 环境里运行（OpenClaw 会注入 `coclaw_empno` / `coclaw_token`），或更新环境变量 `FOUR0S_CCA_EMP_NO` / `FOUR0S_CCA_UAC_TOKEN`、`config.yaml` 的 `cca.emp_no` / `cca.uac_token` 后重试 |
+| `凭据检查：不通过 —— 请求被重定向到登录页` | 同上，鉴权已失效；脚本不会绕过登录 |
+| 接口返回 400 / 返回非 JSON | CCA 开放 API `/api/v2` 的路径或参数与平台版本不一致，或请求被网关拦截；对照 `Studio-CCACodeScan` 技能的 `references/REFERENCE.md` 核对接口 |
 | `local_path 不存在或不是目录` | 用提示的路径克隆仓库，或修正配置 |
 | `warnings` 里出现“仓库名与配置不一致” | 任务 ID 配错了，用扫描结果里的仓库名核对 `projects[].kw_id` / `coverity_id` |
 | `git` 同步失败（本地改动、分支不存在、无 upstream） | 该仓库会被跳过并记入 `warnings`，其余仓库照常；把原因原样告知用户，或用 `--no-sync` 先出结果 |

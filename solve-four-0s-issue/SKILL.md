@@ -9,17 +9,19 @@ metadata:
 
 「4个0」指四类问题的数量都必须为 0：Klocwork Critical、Klocwork Error、Coverity High、Coverity Medium。
 
-本技能负责完整闭环：校验配置与 cookie → 从 CCA 抓取缺陷 → 展示结果并等用户确认 → 修复代码 → 归档修复经验。
+本技能负责完整闭环：校验配置与凭据 → 从 CCA 抓取缺陷 → 展示结果并等用户确认 → 修复代码 → 归档修复经验。
 
 ## 环境
 
 - 依赖 `python3`（`requests`、`pyyaml`）与命令行 `git`。
-- 项目与平台配置在 `config/config.yaml`（含 cookie/csrf，已被 `.gitignore` 忽略）；字段说明与模板见 `config/config.example.yaml`。
+- CCA 接口统一走开放 API（`<base_url>/api/v2`），请求头只需要 `X-Emp-No` + `X-Uac-Token` 两个鉴权参数，不需要浏览器 Cookie。
+- 凭据优先取 OpenClaw 注入的环境变量 `coclaw_empno` / `coclaw_token`；也可以用本技能专用环境变量 `FOUR0S_CCA_EMP_NO` / `FOUR0S_CCA_UAC_TOKEN`，或写进 `config/config.yaml` 的 `cca.emp_no` / `cca.uac_token`。
+- 项目与平台配置在 `config/config.yaml`（已被 `.gitignore` 忽略）；字段说明与模板见 `config/config.example.yaml`。
 - 下列命令都在技能根目录执行。
 
 ## 步骤（按顺序执行）
 
-### 1. 校验配置与 cookie
+### 1. 校验配置与凭据
 
 ```bash
 python3 scripts/scan_leaks.py check
@@ -27,8 +29,8 @@ python3 scripts/scan_leaks.py check
 
 退出码为 0 才能进入下一步：
 
-- 退出码 2（配置不完整）：把脚本列出的缺失项转述给用户，请其补全 `config/config.yaml`，或改用环境变量 `FOUR0S_CCA_COOKIE` / `FOUR0S_CCA_CSRF` 提供凭据，补齐后重新执行本步。
-- 退出码 3（cookie 无效）：告知用户 cookie 已失效，请其重新从浏览器复制 `Cookie` 与 `x-csrf-token` 更新配置。不要试图绕过登录校验，也不要在 cookie 无效时继续抓取。
+- 退出码 2（配置不完整）：把脚本列出的缺失项转述给用户，请其补全 `config/config.yaml`；凭据缺失时优先确认是否在 OpenClaw 环境里运行（OpenClaw 会注入 `coclaw_empno` / `coclaw_token`），也可以改用环境变量 `FOUR0S_CCA_EMP_NO` / `FOUR0S_CCA_UAC_TOKEN`，补齐后重新执行本步。
+- 退出码 3（凭据无效）：告知用户 `X-Emp-No` / `X-Uac-Token` 无效或已失效，请其重新提供员工号与 UAC token。不要试图绕过鉴权，也不要在凭据无效时继续抓取。
 
 ### 2. 扫描
 

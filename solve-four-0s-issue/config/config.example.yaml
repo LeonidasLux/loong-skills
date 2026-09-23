@@ -3,12 +3,18 @@
 # ----------------------------------------------------------------------------
 # 使用方式：
 #   1. 复制为同目录下的 config.yaml：cp config.example.yaml config.yaml
-#   2. 填写 cca.cookie / cca.csrf，以及 projects 下每个项目的本地路径与任务 ID
+#   2. 填写 projects 下每个项目的本地路径与任务 ID（凭据通常由技能/环境变量提供）
 #   3. 执行校验：python3 scripts/scan_leaks.py check
 #
 # config.yaml 已被 .gitignore 忽略（内含凭据，禁止提交）。
-# 也可以用环境变量提供凭据，避免把 cookie 写进文件：
-#   export FOUR0S_CCA_COOKIE='...' ; export FOUR0S_CCA_CSRF='...'
+#
+# CCA 接口走开放 API（<base_url>/api/v2），请求头只需要两个鉴权参数
+# X-Emp-No（员工号）与 X-Uac-Token，不再需要浏览器 Cookie / x-csrf-token。
+# 这两个参数按以下优先级获取：
+#   1. OpenClaw 注入的环境变量 coclaw_empno / coclaw_token
+#      —— 在 OpenClaw 里运行时下面两项可以不配；
+#   2. 本技能专用环境变量 FOUR0S_CCA_EMP_NO / FOUR0S_CCA_UAC_TOKEN；
+#   3. 本文件的 cca.emp_no / cca.uac_token（同样不要提交）。
 # ============================================================================
 
 # CCA 平台与「4个0」判定口径
@@ -17,15 +23,13 @@ cca:
   base_url: "https://cca.zte.com.cn"
   # CCA 项目 ID（任务链接 /workbench/project/<project_id>/task/... 中的一段）
   project_id: "<project-id>"
-  # 登录 CCA 后从浏览器复制出来的完整 Cookie
-  cookie: "<cookie>"
-  # 请求头 x-csrf-token，浏览器开发者工具中获取
-  csrf: "<csrf>"
+  # 员工号（请求头 X-Emp-No）；已由技能/环境变量提供时可留空
+  emp_no: "<emp-no>"
+  # UAC token（请求头 X-Uac-Token）；已由技能/环境变量提供时可留空
+  uac_token: "<uac-token>"
 
   # Klocwork 相关口径
   kw:
-    # Klocwork 任务接口使用的 tool 参数
-    tool: "kwServer-2020.4"
     # 需要清零的优先级
     priorities: ["Critical", "Error"]
     # 只统计以下状态的缺陷（Analyze 表示待分析/未处理）
@@ -33,8 +37,6 @@ cca:
 
   # Coverity 相关口径
   coverity:
-    # Coverity 任务接口使用的 tool 参数
-    tool: "coverity-20230302"
     # 需要清零的优先级
     priorities: ["High", "Medium"]
     # true 时只统计 classification=Unclassified（未分类）的缺陷
