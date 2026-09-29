@@ -6,7 +6,6 @@
 #   2. 填写 projects 下每个项目的本地路径与任务 ID（凭据通常由技能/环境变量提供）
 #   3. 执行校验：python3 scripts/scan_leaks.py check
 #
-# config.yaml 已被 .gitignore 忽略（内含凭据，禁止提交）。
 #
 # CCA 接口走开放 API（<base_url>/api/v2），请求头带两个鉴权参数
 # X-Emp-No（员工号）与 X-Uac-Token。
@@ -44,7 +43,7 @@ cca:
 
   # Hub（开源组件漏洞）
   #
-  # 最小配置只有两项，都与 KW/Coverity 无关：
+  # hub相关配置项：
   #   cca.hub.project_id —— Hub 任务所在项目，所有微服务共用一个
   #   projects[].hub_id  —— 每个微服务自己的 Hub 任务 ID
   # 配好这两项，技能就会用 CCA 开放 API 下载各任务的报告 zip、解压并解析，
