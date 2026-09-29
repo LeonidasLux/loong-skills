@@ -8,8 +8,8 @@
 #
 # config.yaml 已被 .gitignore 忽略（内含凭据，禁止提交）。
 #
-# CCA 接口走开放 API（<base_url>/api/v2），请求头只需要两个鉴权参数
-# X-Emp-No（员工号）与 X-Uac-Token，不再需要浏览器 Cookie / x-csrf-token。
+# CCA 接口走开放 API（<base_url>/api/v2），请求头带两个鉴权参数
+# X-Emp-No（员工号）与 X-Uac-Token。
 # 这两个参数按以下优先级获取：
 #   1. OpenClaw 注入的环境变量 coclaw_empno / coclaw_token
 #      —— 在 OpenClaw 里运行时下面两项可以不配；
@@ -42,21 +42,49 @@ cca:
     # true 时只统计 classification=Unclassified（未分类）的缺陷
     only_unclassified: true
 
+  # Hub（开源组件漏洞）
+  #
+  # 最小配置只有两项，都与 KW/Coverity 无关：
+  #   cca.hub.project_id —— Hub 任务所在项目，所有微服务共用一个
+  #   projects[].hub_id  —— 每个微服务自己的 Hub 任务 ID
+  # 配好这两项，技能就会用 CCA 开放 API 下载各任务的报告 zip、解压并解析，
+  # 产出「组件名 / 版本 / CVE / Origin id（Maven 坐标）」——即要改哪个 pom 依赖。
+  #
+  # 注意：Hub 任务与 KW/Coverity 不在同一个 CCA 项目里，任务链接形如
+  # https://cca.zte.com.cn/workbench/project/<project_id>/task/<task_id>/executions
+  #
+  # 下面几项都是「想要更多」时才配：
+  #   version_name —— 想同时看版本级数量与 BLOCK/ALARM/PASS 指标（只有数量，没有组件名）
+  #   download_dir —— 想指定下载解压位置，实际落点是 <该值 或 output.dir 或当前目录>/hub_download/<project>_<task>/
+  hub:
+    # 【最小配置】Hub 任务所在项目 ID（所有微服务共用）
+    project_id: "<hub-project-id>"
+    # 可选：Hub 版本号，写完整版本名；留空则只出组件明细，不查版本级指标
+    version_name: ""
+    # 可选：自动下载的解压根目录（任务目录固定放在其下的 hub_download/ 里）；留空见上面的默认规则
+    download_dir: ""
+    # 视为已处置、不计入的修复状态（与平台口径一致）
+    ignore_status: ["IGNORED"]
+
 # 需要扫描的项目列表
-# 每个项目对应 CCA 上一个 Klocwork 任务和一个 Coverity 任务：
+# 每个项目对应 CCA 上的 Klocwork / Coverity / Hub 任务，可以只配其中几个：
 #   任务 ID 取自任务链接 https://cca.zte.com.cn/workbench/project/<project_id>/task/<任务ID>/...
+#   Hub 任务在 cca.hub.project_id 指定的项目里（与 KW/Coverity 项目不同），
+#   所以 hub_id 只填任务 ID、不要填项目 ID。
 projects:
   - name: "<仓库名，需与 CCA 返回文件路径中的仓库目录名一致>"
     local_path: "<本地仓库绝对路径>"
     branch: "develop"                  # 本地仓库需检出并固定的分支
     kw_id: "<Klocwork 任务 ID>"         # 无 Klocwork 任务时留空 ""
     coverity_id: "<Coverity 任务 ID>"   # 无 Coverity 任务时留空 ""
+    hub_id: "<Hub 任务 ID>"             # 无 Hub 任务时留空 ""
     enabled: true                      # false 表示本次扫描跳过该项目
   # - name: "another-repo"
   #   local_path: "/path/to/another-repo"
   #   branch: "release_x"
   #   kw_id: ""
   #   coverity_id: "<Coverity 任务 ID>"
+  #   hub_id: ""
 
 # 扫描前的本地仓库同步
 sync:

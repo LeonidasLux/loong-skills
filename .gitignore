@@ -9,3 +9,6 @@ solve-four-0s-issue/config/*.local.yaml
 # 扫描结果（默认输出到执行命令时的当前目录，兜底忽略技能目录下的产物）
 solve-four-0s-issue/leaks_result_*
 solve-four-0s-issue/**/leaks_result_*
+solve-four-0s-issue/**/hub_components_*
+solve-four-0s-issue/**/hub_download/
+CCA 漏洞自动化处理技能文件/*

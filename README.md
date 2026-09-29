@@ -1,3 +1,7 @@
+---
+last_edited: 2026-09-14
+---
+
 # skills
 
 ## 把技能软链接到各 agent 的 skills 目录
