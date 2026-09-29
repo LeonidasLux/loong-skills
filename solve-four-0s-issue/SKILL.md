@@ -3,6 +3,7 @@ name: solve-four-0s-issue
 description: 从 CCA 平台扫描并一键解决「4个0」问题，即 Klocwork Critical、Klocwork Error、Coverity High、Coverity Medium 四类高危缺陷清零；同时汇总 Hub 开源组件漏洞（版本级指标 + 报告 Excel 组件明细）。输出扫描结果时对每条问题给出「建议修复」或「建议备案」的结论，备案项附带可直接使用的备案说明。当用户提出处理 4个0、清理 CCA 上的 Klocwork/Coverity 高危告警、批量修复静态扫描缺陷、处理 Hub 开源组件漏洞时使用。
 metadata:
   short-description: CCA 4个0问题 + Hub 开源组件漏洞扫描、修复/备案建议与经验归档
+  version: 1.3.0
 ---
 
 # solve-four-0s-issue
